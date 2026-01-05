@@ -1,9 +1,4 @@
-
-# Environment variables / secrets
-.env
-
-# Python virtual environments
+.pycache/
 .venv/
-
-# Logs
+.env
 logs/
