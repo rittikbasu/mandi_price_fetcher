@@ -1,18 +1,21 @@
 import os
 import sys
 import time
+import random
 import re
 import logging
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List
 
 import requests
 from dotenv import load_dotenv
 from supabase import create_client
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+
+# ----------------------------
+# Config
+# ----------------------------
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -20,71 +23,78 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_API_KEY")
 
-SUPABASE_TABLE = "mandi_prices_duplicate"
-LIMIT = int(os.getenv("LIMIT", "200"))
-SLEEP = float(os.getenv("SLEEP", "0"))
-RESUME_FROM_DB = os.getenv("RESUME_FROM_DB", "1").strip() not in (
-    "0",
-    "false",
-    "False",
-    "no",
-    "NO",
-)
+SUPABASE_TABLE = os.getenv("SUPABASE_TABLE")
 
 DATA_API_KEY = "579b464db66ec23bdd000001cdc3b564546246a772a26393094f5645"
 RESOURCE_ID = "9ef84268-d588-465a-a308-a864a43d0070"
+DATA_BASE = f"https://api.data.gov.in/resource/{RESOURCE_ID}"
+
+LIMIT = 200
+SUCCESS_SLEEP_SECONDS = 0
+
+RESUME_FROM_DB = True
+
+MAX_RUNTIME_SECONDS = 4 * 60 * 60
+MAX_CONSECUTIVE_ERRORS = 9999
+
+INITIAL_BACKOFF_SECONDS = 5
+MAX_BACKOFF_SECONDS = 120
+JITTER_RATIO = 0.2  # +-20%
 
 TIMEOUT_CONNECT = 10
 TIMEOUT_READ = 120
 
+ROLLOVER_HOUR_IST = 9
+
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 LOG_FILE = os.path.join(LOG_DIR, "cron.log")
 
-# Required vars check
 for k in ("SUPABASE_URL", "SUPABASE_KEY"):
     if not globals().get(k):
         print(f"ERROR: {k} must be set in .env")
         sys.exit(1)
 
-DATA_BASE = f"https://api.data.gov.in/resource/{RESOURCE_ID}"
+# ----------------------------
+# Date logic (IST)
+# ----------------------------
 
 IST = ZoneInfo("Asia/Kolkata")
-TARGET_DATE = datetime.now(IST).date().isoformat()
+
+
+def target_date_for_run(now: Optional[datetime] = None) -> str:
+    now = now or datetime.now(IST)
+    today = now.date()
+    if now.hour < ROLLOVER_HOUR_IST:
+        return (today - timedelta(days=1)).isoformat()
+    return today.isoformat()
+
+
+TARGET_DATE = target_date_for_run()  # YYYY-MM-DD (DB)
 
 
 def to_api_date(iso_date: str) -> str:
-    """
-    data.gov.in mandi dataset uses DD/MM/YYYY for arrival_date.
-    Convert YYYY-MM-DD -> DD/MM/YYYY.
-    """
+    """Convert YYYY-MM-DD -> DD/MM/YYYY (API format)."""
     return datetime.strptime(iso_date, "%Y-%m-%d").strftime("%d/%m/%Y")
 
 
 def normalize_arrival_date(value: Optional[str]) -> Optional[str]:
-    """
-    Normalize arrival_date from API into ISO (YYYY-MM-DD) for DB storage.
-    Accepts either DD/MM/YYYY or already-ISO strings.
-    """
+    """Normalize API arrival_date (DD/MM/YYYY) into ISO (YYYY-MM-DD)."""
     if not value or not isinstance(value, str):
         return value
-
     v = value.strip()
-    # API often returns DD/MM/YYYY (e.g. 05/01/2026)
     try:
         return datetime.strptime(v, "%d/%m/%Y").date().isoformat()
     except ValueError:
         pass
-
-    # Allow already-ISO
     try:
         return datetime.strptime(v, "%Y-%m-%d").date().isoformat()
     except ValueError:
         return v
 
 
-# ------------------------------------------------------------
-# logging (rotating, redacted)
-# ------------------------------------------------------------
+# ----------------------------
+# Logging (rotating, redacted)
+# ----------------------------
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -95,6 +105,7 @@ TOKEN_RE = re.compile(r"(api[_-]?key|authorization|token)\s*[:=]\s*['\"]?\S+", r
 def redact(text: str) -> str:
     if not isinstance(text, str):
         return text
+    # URLs are also stripped from most requests errors ("for url: ..."), but keep this as a safety net.
     text = URL_RE.sub("<REDACTED_URL>", text)
     text = TOKEN_RE.sub("<REDACTED_TOKEN>", text)
     return text
@@ -116,44 +127,57 @@ ch.setFormatter(fmt)
 logger.addHandler(ch)
 
 
-def log_info(msg):
+def log_info(msg: str) -> None:
     logger.info(redact(msg))
 
 
-def log_warn(msg):
+def log_warn(msg: str) -> None:
     logger.warning(redact(msg))
 
 
-def log_error(offset, err, preview=None):
+def log_error(offset: int, err: Exception, preview: Optional[str] = None) -> None:
+    # requests often includes "for url: ..." in the exception string; omit it from logs.
     err_msg = str(err)
     if "for url:" in err_msg:
         err_msg = err_msg.split("for url:", 1)[0].rstrip()
     logger.error(redact(f"⚠️ Error at offset={offset} — {err_msg}"))
     if preview:
-        p = redact(str(preview))
-        logger.error("   server response preview: %s", p[:800])
+        logger.error("   preview: %s", redact(preview)[:800])
+
+
+# ----------------------------
+# Supabase
+# ----------------------------
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+def get_db_offset_for_date(date_str: str) -> int:
+    resp = (
+        supabase.table(SUPABASE_TABLE)
+        .select("id", count="exact")
+        .eq("arrival_date", date_str)
+        .execute()
+    )
+    return resp.count or 0
+
+
+# ----------------------------
+# Core pipeline
+# ----------------------------
+
+TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+
+
+class TransientFetchError(RuntimeError):
+    def __init__(self, msg: str, *, preview: str = ""):
+        super().__init__(msg)
+        self.preview = preview
 
 
 def build_session() -> requests.Session:
-    """
-    Shared HTTP session with sane retries for transient failures.
-    """
     s = requests.Session()
     s.headers.update({"User-Agent": "mandi-fetcher/1.0", "Accept": "application/json"})
-
-    retry = Retry(
-        total=6,
-        connect=6,
-        read=6,
-        status=6,
-        backoff_factor=1.0,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
     return s
 
 
@@ -167,14 +191,24 @@ def fetch_page(
             "offset": offset,
             "limit": limit,
             "format": "json",
-            # Ensure offset is within a stable, date-filtered result set.
             "filters[arrival_date]": api_date,
         },
         timeout=(TIMEOUT_CONNECT, TIMEOUT_READ),
     )
-    # With Retry(raise_on_status=False) we need to raise manually.
+
+    if r.status_code in TRANSIENT_STATUS:
+        raise TransientFetchError(
+            f"HTTP {r.status_code} from data.gov.in", preview=(r.text or "")[:2000]
+        )
+
     r.raise_for_status()
-    payload = r.json()
+    try:
+        payload = r.json()
+    except ValueError:
+        raise TransientFetchError(
+            "Invalid JSON from data.gov.in", preview=(r.text or "")[:2000]
+        )
+
     return payload.get("records", []) or []
 
 
@@ -192,7 +226,6 @@ def normalize_records(
             out[k] = v
         cleaned.append(out)
 
-    # ---- HARD DATE CHECK (post-normalization) ----
     dates = {rec.get("arrival_date") for rec in cleaned}
     if dates != {target_date}:
         raise RuntimeError(f"Unexpected arrival_date(s) received: {dates}")
@@ -200,67 +233,117 @@ def normalize_records(
     return cleaned
 
 
-def insert_batch(rows: List[Dict[str, Any]]) -> None:
-    # insert (no ON CONFLICT / no DB-level dedupe)
-    supabase.table(SUPABASE_TABLE).insert(rows).execute()
+def insert_batch(rows: List[Dict[str, Any]], *, offset: int) -> None:
+    try:
+        resp = supabase.table(SUPABASE_TABLE).insert(rows).execute()
+    except Exception as exc:
+        raise RuntimeError(f"Supabase insert failed: {exc}") from exc
+
+    status = getattr(resp, "status_code", None)
+    error = getattr(resp, "error", None)
+    if (status is not None and status >= 400) or error:
+        err_text = str(error) if error else f"HTTP {status}"
+        raise RuntimeError(f"Supabase insert error: {err_text} (offset={offset})")
 
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+def jitter(seconds: float) -> float:
+    if seconds <= 0:
+        return 0.0
+    delta = seconds * JITTER_RATIO
+    return max(0.0, seconds + random.uniform(-delta, delta))
 
 
-def get_db_offset_for_date(date_str: str) -> int:
-    """
-    Use Supabase as the source of truth.
-    """
-    resp = (
-        supabase.table(SUPABASE_TABLE)
-        .select("id", count="exact")
-        .eq("arrival_date", date_str)
-        .execute()
-    )
-    return resp.count or 0
+def main() -> int:
+    start = time.monotonic()
+    deadline = start + MAX_RUNTIME_SECONDS
 
-
-def main():
-    log_info(f"Starting mandi fetch for date={TARGET_DATE}")
-
+    api_date = to_api_date(TARGET_DATE)
     offset = get_db_offset_for_date(TARGET_DATE) if RESUME_FROM_DB else 0
-    log_info(f"Starting from offset={offset} (resume_from_db={RESUME_FROM_DB})")
+
+    log_info(
+        "Starting mandi fetch "
+        f"date={TARGET_DATE} api_date={api_date} table={SUPABASE_TABLE} "
+        f"offset={offset} limit={LIMIT} "
+        f"max_runtime_s={MAX_RUNTIME_SECONDS} resume_from_db={RESUME_FROM_DB}"
+    )
 
     session = build_session()
 
     consecutive_errors = 0
-    max_backoff = 300
-    api_date = to_api_date(TARGET_DATE)
+    backoff = INITIAL_BACKOFF_SECONDS
 
     while True:
+        now = time.monotonic()
+        if now >= deadline:
+            log_warn(
+                f"Stopping due to max runtime. elapsed_s={int(now - start)} offset={offset}"
+            )
+            return 0
+
         try:
             records = fetch_page(session, offset=offset, limit=LIMIT, api_date=api_date)
-
             if not records:
                 log_info("No more records. Run complete.")
-                break
+                return 0
 
             cleaned = normalize_records(records, target_date=TARGET_DATE)
-            insert_batch(cleaned)
+            insert_batch(cleaned, offset=offset)
 
             offset += len(cleaned)
             log_info(f"Inserted {len(cleaned)} records | offset now {offset}")
 
+            # Success resets backoff immediately.
             consecutive_errors = 0
-            if SLEEP:
-                time.sleep(SLEEP)
+            backoff = INITIAL_BACKOFF_SECONDS
+
+            if SUCCESS_SLEEP_SECONDS:
+                time.sleep(SUCCESS_SLEEP_SECONDS)
+
+        except TransientFetchError as e:
+            consecutive_errors += 1
+            log_error(offset, e, e.preview)
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            consecutive_errors += 1
+            log_error(offset, e)
+
+        except requests.exceptions.HTTPError as e:
+            consecutive_errors += 1
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code in TRANSIENT_STATUS:
+                body = ""
+                try:
+                    body = (
+                        (e.response.text or "")[:2000] if e.response is not None else ""
+                    )
+                except Exception:
+                    body = ""
+                log_error(offset, e, body)
+            else:
+                log_error(offset, e)
+                log_error(offset, RuntimeError("Non-retryable HTTP error; aborting."))
+                return 2
 
         except Exception as e:
             consecutive_errors += 1
-            backoff = min(2**consecutive_errors, max_backoff)
-            preview = getattr(e, "response", None)
-            log_error(offset, e, preview)
-            log_info(f"Retrying in {backoff}s")
-            time.sleep(backoff)
+            log_error(offset, e)
 
-    log_info("✅ Done.")
+        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            log_error(
+                offset,
+                RuntimeError(
+                    f"Exceeded MAX_CONSECUTIVE_ERRORS={MAX_CONSECUTIVE_ERRORS}; aborting."
+                ),
+            )
+            return 2
+
+        sleep_s = jitter(min(backoff, MAX_BACKOFF_SECONDS))
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            continue
+        time.sleep(min(sleep_s, remaining))
+        backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
