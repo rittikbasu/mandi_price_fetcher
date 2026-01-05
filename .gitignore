@@ -1,0 +1,9 @@
+
+# Environment variables / secrets
+.env
+
+# Python virtual environments
+.venv/
+
+# Logs
+logs/
