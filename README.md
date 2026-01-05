@@ -4,10 +4,9 @@ a simple script to pull daily mandi prices from data.gov.in and drop them into s
 
 ## why
 
-- got tired of the govt api being fast one minute and dead the next, so built a tiny script that can babysi
-  t itself
-- wanted something i could cron and ignore, not a mini framework
-- needed it to survive 2–3 hour dry spells without losing track of where it left off
+- got tired of the govt api being flaky and not working for hours at a time
+- wanted something i could cron and ignore
+- needed it to pause, retry, and resume without me babysitting it
 
 ## what it does
 
@@ -42,6 +41,7 @@ drop it in cron if you like. logs go to `logs/cron.log`.
 
 ## notes
 
+- source: https://www.data.gov.in/resource/current-daily-price-various-commodities-various-markets-mandi
 - api key is the public demo key from data.gov.in
 - there’s no dedupe in supabase; if the api ever reorders, add a constraint or dedupe job
 - if the feed keeps lagging past 9am, change the rollover constant in `main.py`
