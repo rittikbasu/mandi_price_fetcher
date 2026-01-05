@@ -1,0 +1,6 @@
+requests>=2.31,<3
+python-dotenv>=1.0,<2
+supabase>=2,<3
+# macOS system Python often links against LibreSSL; urllib3 v2 warns there.
+urllib3<2
+
