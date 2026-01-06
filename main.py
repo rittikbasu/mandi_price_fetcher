@@ -40,6 +40,7 @@ MAX_CONSECUTIVE_ERRORS = 9999
 INITIAL_BACKOFF_SECONDS = 5
 MAX_BACKOFF_SECONDS = 120
 JITTER_RATIO = 0.2  # +-20%
+MAX_EMPTY_PAGE_RETRIES = 5
 
 TIMEOUT_CONNECT = 10
 TIMEOUT_READ = 120
@@ -142,6 +143,9 @@ def log_error(offset: int, err: Exception, preview: Optional[str] = None) -> Non
         err_msg = err_msg.split("for url:", 1)[0].rstrip()
     logger.error(redact(f"⚠️ Error at offset={offset} — {err_msg}"))
     if preview:
+        # skip noisy html error bodies
+        if isinstance(preview, str) and "<html" in preview.lower():
+            return
         logger.error("   preview: %s", redact(preview)[:800])
 
 
@@ -233,9 +237,33 @@ def normalize_records(
     return cleaned
 
 
-def insert_batch(rows: List[Dict[str, Any]], *, offset: int) -> None:
+def insert_batch(rows: List[Dict[str, Any]], *, offset: int) -> int:
+    # remove duplicates within the batch to avoid ON CONFLICT issues in a single statement
+    deduped: Dict[tuple, Dict[str, Any]] = {}
+    for row in rows:
+        key = (
+            row.get("state"),
+            row.get("district"),
+            row.get("market"),
+            row.get("commodity"),
+            row.get("variety"),
+            row.get("grade"),
+            row.get("arrival_date"),
+        )
+        deduped[key] = row
+
+    if not deduped:
+        return 0
+
     try:
-        resp = supabase.table(SUPABASE_TABLE).insert(rows).execute()
+        resp = (
+            supabase.table(SUPABASE_TABLE)
+            .upsert(
+                list(deduped.values()),
+                on_conflict="state,district,market,commodity,variety,grade,arrival_date",
+            )
+            .execute()
+        )
     except Exception as exc:
         raise RuntimeError(f"Supabase insert failed: {exc}") from exc
 
@@ -244,6 +272,7 @@ def insert_batch(rows: List[Dict[str, Any]], *, offset: int) -> None:
     if (status is not None and status >= 400) or error:
         err_text = str(error) if error else f"HTTP {status}"
         raise RuntimeError(f"Supabase insert error: {err_text} (offset={offset})")
+    return len(deduped)
 
 
 def jitter(seconds: float) -> float:
@@ -259,6 +288,7 @@ def main() -> int:
 
     api_date = to_api_date(TARGET_DATE)
     offset = get_db_offset_for_date(TARGET_DATE) if RESUME_FROM_DB else 0
+    empty_page_retries = 0
 
     log_info(
         "Starting mandi fetch "
@@ -283,14 +313,34 @@ def main() -> int:
         try:
             records = fetch_page(session, offset=offset, limit=LIMIT, api_date=api_date)
             if not records:
-                log_info("No more records. Run complete.")
-                return 0
+                empty_page_retries += 1
+                if empty_page_retries >= MAX_EMPTY_PAGE_RETRIES:
+                    log_info(
+                        f"No more records after {MAX_EMPTY_PAGE_RETRIES} retries. Run complete."
+                    )
+                    return 0
+                sleep_s = jitter(
+                    min(
+                        INITIAL_BACKOFF_SECONDS * empty_page_retries,
+                        MAX_BACKOFF_SECONDS,
+                    )
+                )
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining > 0:
+                    time.sleep(min(sleep_s, remaining))
+                log_warn(
+                    f"Empty page received; retrying ({empty_page_retries}/{MAX_EMPTY_PAGE_RETRIES})."
+                )
+                continue
 
             cleaned = normalize_records(records, target_date=TARGET_DATE)
-            insert_batch(cleaned, offset=offset)
+            inserted_count = insert_batch(cleaned, offset=offset)
+            empty_page_retries = 0
 
             offset += len(cleaned)
-            log_info(f"Inserted {len(cleaned)} records | offset now {offset}")
+            log_info(
+                f"Inserted {inserted_count} records (post-dedupe) | offset now {offset}"
+            )
 
             # Success resets backoff immediately.
             consecutive_errors = 0
