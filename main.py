@@ -4,6 +4,7 @@ import time
 import random
 import re
 import logging
+import json
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -41,6 +42,8 @@ INITIAL_BACKOFF_SECONDS = 5
 MAX_BACKOFF_SECONDS = 120
 JITTER_RATIO = 0.2  # +-20%
 MAX_EMPTY_PAGE_RETRIES = 5
+MAX_TOTAL_ROWS = 300_000
+MAX_STATE_DATES = 3
 
 TIMEOUT_CONNECT = 10
 TIMEOUT_READ = 120
@@ -49,6 +52,7 @@ ROLLOVER_HOUR_IST = 9
 
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 LOG_FILE = os.path.join(LOG_DIR, "cron.log")
+STATE_FILE = os.path.join(LOG_DIR, "state.json")
 
 for k in ("SUPABASE_URL", "SUPABASE_KEY"):
     if not globals().get(k):
@@ -275,6 +279,65 @@ def insert_batch(rows: List[Dict[str, Any]], *, offset: int) -> int:
     return len(deduped)
 
 
+def prune_if_needed() -> None:
+    total_resp = supabase.table(SUPABASE_TABLE).select("id", count="exact").execute()
+    total = total_resp.count or 0
+    if total < MAX_TOTAL_ROWS:
+        return
+
+    earliest_resp = (
+        supabase.table(SUPABASE_TABLE)
+        .select("arrival_date")
+        .order("arrival_date", desc=False)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(earliest_resp, "data", None) or []
+    if not rows:
+        return
+    earliest_date = rows[0].get("arrival_date")
+    if not earliest_date:
+        return
+
+    day_count_resp = (
+        supabase.table(SUPABASE_TABLE)
+        .select("id", count="exact")
+        .eq("arrival_date", earliest_date)
+        .execute()
+    )
+    day_count = day_count_resp.count or 0
+
+    supabase.table(SUPABASE_TABLE).delete().eq("arrival_date", earliest_date).execute()
+    log_warn(
+        f"Pruned {day_count} rows for earliest date {earliest_date} (total >= {MAX_TOTAL_ROWS})"
+    )
+
+
+def load_state() -> Dict[str, int]:
+    try:
+        with open(STATE_FILE, "r") as fh:
+            data = json.load(fh)
+            if isinstance(data, dict):
+                return {k: int(v) for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def save_state(state: Dict[str, int]) -> None:
+    # keep only the most recent dates to avoid unbounded growth
+    trimmed = dict(
+        sorted(state.items(), key=lambda kv: kv[0], reverse=True)[:MAX_STATE_DATES]
+    )
+    tmp_path = f"{STATE_FILE}.tmp"
+    try:
+        with open(tmp_path, "w") as fh:
+            json.dump(trimmed, fh)
+        os.replace(tmp_path, STATE_FILE)
+    except Exception:
+        pass
+
+
 def jitter(seconds: float) -> float:
     if seconds <= 0:
         return 0.0
@@ -285,9 +348,12 @@ def jitter(seconds: float) -> float:
 def main() -> int:
     start = time.monotonic()
     deadline = start + MAX_RUNTIME_SECONDS
+    prune_if_needed()
+    state = load_state()
 
     api_date = to_api_date(TARGET_DATE)
-    offset = get_db_offset_for_date(TARGET_DATE) if RESUME_FROM_DB else 0
+    db_offset = get_db_offset_for_date(TARGET_DATE) if RESUME_FROM_DB else 0
+    offset = max(db_offset, state.get(TARGET_DATE, 0))
     empty_page_retries = 0
 
     log_info(
@@ -341,6 +407,8 @@ def main() -> int:
             log_info(
                 f"Inserted {inserted_count} records (post-dedupe) | offset now {offset}"
             )
+            state[TARGET_DATE] = offset
+            save_state(state)
 
             # Success resets backoff immediately.
             consecutive_errors = 0
