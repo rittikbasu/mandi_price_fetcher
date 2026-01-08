@@ -222,8 +222,22 @@ def fetch_page(
 
 def normalize_records(
     records: List[Dict[str, Any]], *, target_date: str
-) -> List[Dict[str, Any]]:
+) -> tuple[List[Dict[str, Any]], int]:
     cleaned: List[Dict[str, Any]] = []
+    skipped_zero = 0
+
+    def zero_price(v: Any) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, (int, float)):
+            return v == 0
+        if isinstance(v, str):
+            try:
+                return float(v.strip() or "0") == 0
+            except Exception:
+                return False
+        return False
+
     for rec in records:
         out: Dict[str, Any] = {}
         for k, v in rec.items():
@@ -232,13 +246,20 @@ def normalize_records(
             if k == "arrival_date":
                 v = normalize_arrival_date(v)
             out[k] = v
+        if any(
+            zero_price(out.get(field))
+            for field in ("min_price", "max_price", "modal_price")
+        ):
+            skipped_zero += 1
+            continue
         cleaned.append(out)
 
-    dates = {rec.get("arrival_date") for rec in cleaned}
-    if dates != {target_date}:
-        raise RuntimeError(f"Unexpected arrival_date(s) received: {dates}")
+    if cleaned:
+        dates = {rec.get("arrival_date") for rec in cleaned}
+        if dates != {target_date}:
+            raise RuntimeError(f"Unexpected arrival_date(s) received: {dates}")
 
-    return cleaned
+    return cleaned, skipped_zero
 
 
 def insert_batch(rows: List[Dict[str, Any]], *, offset: int) -> int:
@@ -399,14 +420,25 @@ def main() -> int:
                 )
                 continue
 
-            cleaned = normalize_records(records, target_date=TARGET_DATE)
-            inserted_count = insert_batch(cleaned, offset=offset)
+            batch_size = len(records)
+            cleaned, skipped_zero = normalize_records(records, target_date=TARGET_DATE)
+            if cleaned:
+                inserted_count = insert_batch(cleaned, offset=offset)
+                if skipped_zero:
+                    log_warn(
+                        f"Skipped {skipped_zero} zero-price rows at offset {offset}"
+                    )
+                log_info(
+                    f"Inserted {inserted_count} records (post-dedupe) | offset now {offset + batch_size}"
+                )
+            else:
+                inserted_count = 0
+                log_warn(
+                    f"Skipped batch at offset {offset} due to zero prices; offset now {offset + batch_size}"
+                )
             empty_page_retries = 0
 
-            offset += len(cleaned)
-            log_info(
-                f"Inserted {inserted_count} records (post-dedupe) | offset now {offset}"
-            )
+            offset += batch_size
             state[TARGET_DATE] = offset
             save_state(state)
 
